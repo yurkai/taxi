@@ -78,7 +78,11 @@ get_region <- function(lon, lat){
     (lon_cell - 1) * NY$CELLS + lat_cell
 }
 
-# 
+
+
+############################################################
+# проставить таблице регионы для каждой строки
+
 make_regions <- function(dt){
     dt[, region := get_region(pickup_longitude, pickup_latitude)]
 }
