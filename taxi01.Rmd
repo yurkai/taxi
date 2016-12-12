@@ -1,0 +1,392 @@
+---
+title: "Желтое такси в Нью-Йорке"
+output:
+  html_document: 
+    toc: yes
+  html_notebook: default
+---
+
+*Задача этого проекта — научиться предсказывать количество поездок в ближайшие часы в каждом районе Нью-Йорка. Для того, чтобы её решить, сырые данные необходимо агрегировать по часам и районам. Агрегированные данные будут представлять собой почасовые временные ряды с количествами поездок из каждого района. Похожие задачи возникают на практике, если вам необходимо спрогнозировать продажи большого количества товаров в большом количестве магазинов, объём снятия денег в сети банкоматов, посещаемость разных страниц сайта и т.д.*
+
+# Неделя 1: Знакомство с данными и агрегация
+
+### 0. Вступление и подготовка к работе
+
+Авторы проекта предложили использовать инструмент на выбор. Т.к. для меня это второй проект, то я решил его сделать на R. Ввиду того, что в специализации используется Python, то в основном тексте будет немного когда, чтобы лишний раз не раздражать ревьювера. Я постарался снабдить код комментариями, чтобы (при желании) легче было разобраться, а полный код используемых функций доступен в конце этого ноутбука.
+
+Для работы потребуются следующие библиотеки и файлы:
+
+```{r libs, message=FALSE}
+library(lubridate) # работа с датами
+library(ggplot2) # графики
+library(ggmap) # геоданные с Гугла
+library(magrittr) # c'est ne pas une pipe
+
+library(data.table) # работа с таблицами данных
+
+source('helpers01.R') # здесь вспомогательные функции
+
+# Sys.setlocale('LC_ALL','utf-8') # если неверно отображается кириллица
+```
+
+Информация о версиях библиотек и системе:
+
+```{r versions}
+sessionInfo()
+```
+
+
+
+### 1. Загрузите данные за май 2016 года
+
+```{r load_may, cache=TRUE, message=FALSE, results='hide'}
+regions <- fread('data_in/regions.csv') # данные о регионах
+
+dt_month <- fread('data_in/yellow_tripdata_2016-05.csv') # поездки в мае
+# Read 11836853 rows and 19 (of 19) columns from 1.731 GB file in 00:00:49
+```
+
+Таблица с регионами:
+
+```{r regions_table}
+head(regions)
+```
+
+
+Таблица с данными о поездках имеет следующую структуру:
+
+```{r struct, cache=TRUE}
+# структура таблицы о поездках
+str(dt_month)
+```
+
+
+
+### 2. Проведите фильтрацию
+
+*Удалите поездки с:*
+
+- *нулевой длительностью,*
+- *нулевым количеством пассажиров,*
+- *нулевым расстоянием поездки по счётчику,*
+- *координатами начала, не попадающими в прямоугольник Нью-Йорка.*
+
+Для очистки данных и рассчетов заведем переменную с константами о геоданных:
+
+```{r NY}
+##########################
+# Константа с геоданными #
+##########################
+
+# Нью-Йорк вписан в прямоугольник от -74.25559 до -73.70001 градусов долготы и от 40.49612 до 40.91553 широты
+NY <- list(lon = c(-74.25559, -73.70001), lat = c(40.49612, 40.91553))
+NY$CELLS <- 50 # число ячеек по широте или долготе
+NY$lon_step <- (NY$lon[2] - NY$lon[1]) / NY$CELLS # шаг по долготе
+NY$lat_step <- (NY$lat[2] - NY$lat[1]) / NY$CELLS # шаг по широте
+NY$lon_breaks <- seq(NY$lon[1], NY$lon[2], by = NY$lon_step) # границы регионов по долготе
+NY$lat_breaks <- seq(NY$lat[1], NY$lat[2], by = NY$lat_step) # границы регионов по широте
+```
+
+Очистка и подготовка данных (код функций в [приложении](#--)):
+
+```{r clear_data, cache=TRUE}
+dt_month <- make_durations(dt_month) # вводим длительность поездки (сек)
+dt_month <- drop_0_duration(dt_month) # отбрасываем поездки с нулевой длительностью
+dt_month <- drop_0_passenger_count(dt_month) # выбрасываем поездки без пассажирова
+dt_month <- drop_0_trip_distance(dt_month) # убираем поездки с нулеввым расстоянием
+dt_month <- drop_out_of_NY(dt_month) # исключаем поездки с посадкой вне Нью-Йорка
+```
+
+
+
+### 3. Агрегируйте данные за май 2016 года по часам и областям
+
+*Не забудьте проверить, что идентификаторы, которые вы присваиваете ячейкам, соответствуют приложенному выше файлу.*
+
+Проверим, что [функция](#get_region) определения региона выдает результаты в соответствии с файлом `regions.csv`. Легко заметить, что регионы нумеруются сверху вниз, а затем слева направо:
+
+```
+   #50 |  50 | 100 | 150 | ... | 2500 |
+#  #49 |  49 |  99 | 149 | ... | 2499 |
+L  ... | ... | ... | ... | ... | ...  |
+O   #3 |   3 |  53 | 103 | ... | 2453 |
+N   #2 |   2 |  52 | 102 | ... | 2452 |
+    #1 |   1 |  51 | 101 | ... | 2451 |
+------------------------------------
+       |  #1 |  #2 |  #3 | ... |  #50 |
+                  #LAT
+```
+
+Таким образом, `номер региона = (#LON - 1)*50 + #LAT`
+
+```{r check_regions}
+# чтобы не было вывода используется присваивание <-
+# добавим каждому региону центр ячейки
+regions <- regions[, `:=`(lon_mid = (east + west) / 2,
+                          lat_mid = (south + north) / 2)]
+
+# для центра каждой ячейки посчитаем регион функцией (в поле my_region)
+regions <- regions[, my_region := get_region(lon_mid, lat_mid)]
+
+# проверим, что все регионы совпадают
+all(regions[, region == my_region]) # аее!
+
+# можно посмотреть на начало и конец таблички
+# (только столбцы: region, lon_mid, lat_mid, my_region)
+regions[, .(region, lon_mid, lat_mid, my_region)]
+```
+
+Теперь можно [присвоить](#make_regions) регионы всем строкам исходных данных о поездках:
+
+```{r make_regions_dt, cache=TRUE}
+dt_month <- make_regions(dt_month)
+
+# посмотрим хвостик таблицы
+tail(dt_month[, .(VendorID, tpep_pickup_datetime, passenger_count, region)])
+```
+
+Затем [сагрегируем](#get_dt_agg_with_zeroes) данные по паре час-ячейка для каждого дня. Для регионов из которых не было поездок значение равно 0.
+
+```{r make_agg, cache=TRUE}
+dt_agg <- get_dt_agg_with_zeroes(dt_month)
+```
+
+
+
+### 4. Выведите первые строки полученной таблицы
+
+```{r print_agg}
+# первые строки агрегированной таблицы
+head(dt_agg)
+
+# ячейка с максимальным числом поездок
+dt_agg[n == max(n)]
+
+```
+
+
+
+### 5. Постройте график количества поездок жёлтого такси из ячейки, содержащей Empire State Building
+
+```{r ESB}
+# так можно узнать координаты Empire State Building
+# ESB <- as.list(geocode('Empire State Building'))
+
+# на случай, если нет подключения, введем координаты вручную
+ESB <- list(lon = -73.98566, lat = 40.74844)
+
+# вычислим регион для Empire State Building и посмотрим на него
+ESB$region <- get_region(ESB$lon, ESB$lat)
+ESB$region
+
+# вытащим из агрегированной таблицы данные только по нашему региону
+dt_ESB <- dt_agg[region == ESB$region]
+dt_ESB <- dt_ESB[, date := paste(year, month, day, hour) %>% ymd_h]
+
+# выведем табличку
+dt_ESB
+```
+
+Построим график количества поездок из таблички `1231`:
+
+```{r plot_ESB_region, fig.asp=1/4, fig.width=10}
+ggplot(dt_ESB, aes(date, n)) + geom_line() +
+    ylim(-100, 1500) + 
+    labs(title = "Поездки из региона 1231 за май", x = "Дата", 
+         y = "Количество поездок")
+```
+
+
+
+### 6. Посчитайте, сколько в мае 2016 было пар час-ячейка, для которых не было совершено ни одной поездки
+
+Большинство пар час-ячейка нулевые:
+
+```{r zero_rows}
+# количество нулевых ячеек
+dt_agg[n == 0, .N]
+
+# всего ячеек:
+31 * 24 * 2500
+```
+
+
+
+### 7. Публикация ноутбука и сохранение данных
+
+Сохраним полученную таблицу агрегированных данных:
+
+```{r save dt_agg}
+fwrite(dt_agg, 'data_out/2016_05.csv')
+```
+
+Ноутбук опубликован на [rstudioconnect.com](https://beta.rstudioconnect.com/content/2211/taxi01.html). Файлы проекта также можно найти и на [гитхабе](https://github.com/yurkai/taxi).
+
+
+
+### 8. Приложение: код функций
+
+Здесь приведен код использовавшихся функций.
+
+##### 8.1 make_durations
+
+```{r make_durations}
+# вводим новый признак -- продолжительность поездки
+make_durations <- function(dt){
+    # время посадки высадки -- character
+    dt[,`:=`(
+      tpep_pickup_datetime = parse_date_time(tpep_pickup_datetime, "YmdHMS"),
+      tpep_dropoff_datetime = parse_date_time(tpep_dropoff_datetime, "YmdHMS"))]
+    dt[, duration := as.numeric(tpep_dropoff_datetime - tpep_pickup_datetime,
+                                units = "secs")]
+    setkey(dt, tpep_pickup_datetime)
+    
+    dt
+}
+```
+
+
+##### 8.2 drop_0_duration
+
+```{r drop_0_duration}
+# удалить строки с duration == 0
+drop_0_duration <- function(dt){
+    dt[duration != 0]
+}
+```
+
+
+##### 8.3 drop_0_passenger_count
+
+```{r drop_0_passenger_count}
+# удалить строки с passenger_count == 0
+drop_0_passenger_count <- function(dt){
+    dt[passenger_count != 0]
+}
+```
+
+
+##### 8.4 drop_0_trip_distance
+
+```{r drop_0_trip_distance}
+# удалить строки с trip_distance == 0
+drop_0_trip_distance <- function(dt){
+    dt[trip_distance != 0]
+}
+```
+
+
+##### 8.5 drop_out_of_NY
+
+```{r drop_out_of_NY}
+# удалить строки с координатами начала, не попадающими в прямоугольник Нью-Йорка
+drop_out_of_NY <- function(dt){
+    dt[pickup_longitude >= NY$lon[1] & pickup_longitude <= NY$lon[2] &
+       pickup_latitude >= NY$lat[1] & pickup_latitude <= NY$lat[2]]
+}
+```
+
+
+##### 8.6 get_region
+
+```{r get_region}
+# определение ячейки по координатам
+get_region <- function(lon, lat){
+    lon_cell <- findInterval(lon, NY$lon_breaks, rightmost.closed=TRUE)
+    lat_cell <- findInterval(lat, NY$lat_breaks, rightmost.closed=TRUE)
+    
+    (lon_cell - 1) * NY$CELLS + lat_cell
+}
+```
+
+
+##### 8.7 make_regions
+
+```{r make_regions}
+# проставить регион для всех данных
+make_regions <- function(dt){
+    dt[, region := get_region(pickup_longitude, pickup_latitude)]
+}
+```
+
+
+##### 8.8 get_dt_agg_with_zeroes
+
+```{r}
+# табличка агрегированных данных
+get_dt_agg_with_zeroes <- function(dt){
+    # добавим час и день (потом еще надо будет месяц)
+    dt[, `:=`(day = mday(tpep_pickup_datetime),
+                    hour = hour(tpep_pickup_datetime))]
+    first_date <- dt[1, tpep_pickup_datetime]
+    
+    # узнаем есть ли пропуски по датам
+    days <- days_in_month(first_date) %>% seq_len
+    missing_days <- setdiff(days, dt[, unique(day)]) # паранойя
+    if (length(missing_days) > 0){
+        # добавляем эти дни в данные
+        dt_missing <- data.table(region = 1, day = missing_days, hour = 0)
+        dt <- rbindlist(list(dt, dt_missing), fill = TRUE)
+    }
+    
+    # узнаем есть ли пропуски по часам
+    missing_hours <- setdiff(1:23, dt[, unique(hour)]) # еще паранойя
+    if (length(missing_hours) > 0){
+        dt_missing <- data.table(region = 1, day = 1, hour = missing_hours)
+        dt <- rbindlist(list(dt, dt_missing), fill = TRUE)
+    }
+    
+    # узнаем есть ли пропуски по регионам
+    missing_regions <- setdiff(seq_len(nrow(regions)), dt[, unique(region)])
+    if (length(missing_regions) > 0){
+        dt_missing <- data.table(region = missing_regions, day = 1, hour = 0)
+        dt <- rbindlist(list(dt, dt_missing), fill = TRUE)
+    }
+    
+    # делаем сводную
+    setkey(dt, day, hour, region)
+    dt_agg <- dt[CJ(day, hour, region, unique = TRUE), .(n = .N), by = .EACHI]
+    # надо обнулить частоты для искусственно введенных значений
+    dt_agg[(day %in% missing_days) | 
+           (hour %in% missing_hours) | 
+           (region %in% missing_regions), n := 0]
+    
+    # и еще паранойя
+    # можно проверить, что добавляем все правильно:
+    # никаких левых данных мы не записали
+    # dt_agg[(region %in% missing_regions), unique(region)] %>%
+    #     setdiff(., missing_regions)
+    # 
+    # количество строк правильное: дней_в_месяце * часов_в_дне * число_регионов
+    # nrow(dt_agg) == 
+    #     nrow(regions) * days_in_month(dt[1, tpep_pickup_datetime]) * 24
+    
+    # добавляем месяц в получившуюся таблицу
+    dt_agg[, `:=`(month = month(first_date),
+                  year = year(first_date))]
+    
+    # устанавливаем красивый порядок колонок
+    setcolorder(dt_agg, c('year', 'month', 'day','hour', 'region', 'n'))
+    
+    # если не жалко время, можно вернуть данные к исходному числу строк
+    # dt <- dt[!((day %in% missing_days) |
+    #                            (hour %in% missing_hours) | 
+    #                            (region %in% missing_regions))]
+    # dt[,`:=`(day = NULL, hour = NULL)]
+    
+    dt_agg
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
