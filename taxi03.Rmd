@@ -63,6 +63,13 @@ xreg <- get_xreg(k = 5, to = nrow(reg_1333))
 xreg %>% head
 ```
 
+График ряда из региона 1333:
+
+```{r fig.asp=1/4, fig.width=10}
+ggplot(reg_1333, aes(date, n)) + geom_line() +
+    labs(title = "Количество поездок из региона 1333", 
+         x = "Дата", y = "n")
+```
 
 
 ### 2. Сделайте регрессию целевого признака {#w3s2}
