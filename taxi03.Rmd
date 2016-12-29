@@ -1,0 +1,545 @@
+---
+title: "Желтое такси в Нью-Йорке"
+output:
+  html_document: 
+    toc: yes
+  html_notebook: default
+---
+
+*Задача этого проекта — научиться предсказывать количество поездок в ближайшие часы в каждом районе Нью-Йорка. Для того, чтобы её решить, сырые данные необходимо агрегировать по часам и районам. Агрегированные данные будут представлять собой почасовые временные ряды с количествами поездок из каждого района. Похожие задачи возникают на практике, если вам необходимо спрогнозировать продажи большого количества товаров в большом количестве магазинов, объём снятия денег в сети банкоматов, посещаемость разных страниц сайта и т.д.*
+
+# Неделя 3: Прогнозирование ряда со сложной сезонностью {#week03}
+
+### 0. Вступление и подготовка к работе {#w3s0}
+
+Авторы проекта предложили использовать инструмент на выбор. Т.к. для меня это второй проект, то я решил его сделать на R. Ввиду того, что в специализации используется Python, я постарался снабдить код подробными комментариями, чтобы (при желании) было легче разобраться.
+
+Ссылки на прошлые недели: [Неделя 1](https://beta.rstudioconnect.com/content/2211/taxi01.html), [Неделя 2](https://beta.rstudioconnect.com/content/2218/taxi02.html).
+
+Для работы потребуются следующие библиотеки:
+
+```{r libs, message=FALSE}
+library(wesanderson) # палитры для графиков
+library(scales) # в помощь графикам
+library(ggplot2) # графики
+library(plotly) # интерактивные графики
+library(magrittr) # c'est ne pas une pipe
+library(lubridate) # работа с датами
+library(forecast) # предсказания рядов
+library(data.table) # работа с таблицами данных
+
+source('helpers03.R') # здесь вспомогательные функции
+
+# Sys.setlocale('LC_ALL','utf-8') # если неверно отображается кириллица
+```
+
+Информация о версиях библиотек и системе:
+
+
+```{r versions}
+sessionInfo()
+```
+
+
+### 1. Выберите одну из зон среди отобранных на прошлой неделе {#w3s1}
+
+*Выберите одну из зон среди отобранных на прошлой неделе, возьмите по ней все подготовленные данные о количестве поездок. Не используйте данные за последний имеющийся месяц — июнь 2016! Создайте регрессионные признаки для учёта сезонностей и трендов*
+
+[Загрузим](#read_regions) [агрегированные](#raw_to_agg) данные о поездках из ячейки `1333` и удалим июнь 2016:
+
+```{r select_reg, cache=TRUE}
+regions_to_read <- c(1333)
+reg_1333_all <- read_regions(regions_to_read)
+reg_1333 <- reg_1333_all[date < as.Date('2016-06-01')]
+setnames(reg_1333, 2, 'n')
+# переведем данные в формат временного ряда
+ts_1333 <- ts(reg_1333[,n], start = 1, frequency = 24)
+```
+
+[Создадим](#get_xreg) регрессионные признаки для учета тренда и сезонности, возьмем `k = 5`:
+
+```{r xreg_1333}
+xreg <- get_xreg(k = 5, to = nrow(reg_1333))
+xreg %>% head
+```
+
+
+
+### 2. Сделайте регрессию целевого признака {#w3s2}
+
+*Чтобы примерно подобрать порядки дифференцирования ряда в модели ARIMA, сделайте регрессию целевого признака — количества поездок — на построенные признаки. Посмотрите на остатки регрессии. Если регрессионные признаки подобраны идеально, то в них должна остаться только внутрисуточная сезонность. Вслепую идеально подобрать признаки вам вряд ли удастся, так что в остатках вы, скорее всего, увидите много интересного, в том числе праздники, аномалии, тренды и многое другое.*
+
+
+
+```{r reg_1333_lm, cache=TRUE}
+lr <- lm(n ~ ., data = cbind(reg_1333[,.(n)], xreg))
+summary(lr)
+```
+
+Вот как выглядят остатки:
+
+```{r residuals_plot, fig.asp=1/4, fig.width=10}
+cbind(reg_1333[,.(date)], residuals = lr$residuals) %>%
+    ggplot(aes(date, residuals)) + geom_line() +
+    labs(title = "Остатки регрессии", x = "Дата", y = "Остатки")
+```
+
+
+
+### 3. Подберите значения гиперпараметров ARIMA для ряда остатков {#w3s3}
+
+*Чтобы подобрать значения гиперпараметров ARIMA, попробуйте сделать ряд остатков стационарным. Если необходимо, сделайте несколько дифференцирований. Из-за большого количества аномальных дней (праздники и т.д.) вряд ли вам удастся сделать так, что критерий Дики-Фуллера не будет отвергать гипотезу нестационарности, поэтому при выборе порядка дифференцирования ориентируйтесь в первую очередь на результат STL-декомпозиции.*
+
+Попробуем сделать ряд стационарным. Стабилизировать дисперсию не надо, для преобразования Бокса-Кокса получим коэффициент $\lambda=0.98$, т.е. ряд практически не изменится. Продифференцируем остатки по дням:
+
+```{r diff_d_plot, fig.width=10}
+# преобразуем данные в ряд
+ts_1333_res <- ts(lr$residuals, start = 1, frequency = 24)
+# преобразование бокса-кокса
+lambda_bc <- BoxCox.lambda(ts_1333_res)
+lambda_bc
+# продифференцируем ряд по дням
+ts_1333_res_diff_d <- diff(ts_1333_res, 24)
+autoplot(stl(ts_1333_res_diff_d, s.window = 'periodic')) + 
+    labs(x = 'Дни', title = 'STL для дифференцированного по дням ряда')
+```
+
+Тренда практически нет, на графике хорошо заметны аномалии. В остатках присутствует не только дневная, но и недельная сезонность.
+
+Выполним обычное дифференцирование исходного ряда:
+
+```{r diff_h_plot, fig.width=10}
+# продифференцируем ряд по часам
+ts_1333_res_diff_h <- diff(ts_1333_res, 1)
+autoplot(stl(ts_1333_res_diff_h, s.window = 'periodic')) + 
+    labs(x = 'Дни', title = 'STL для дифференцированного по часам ряда')
+```
+
+
+Посмотрим STL-декомпозицию ряда, которой продифференцировали сначала по дням, потом по часам:
+
+```{r diff_d_h_plot, fig.width=10}
+# продифференцируем ряд по часам
+ts_1333_res_diff_d_h <- diff(ts_1333_res_diff_d, 1)
+autoplot(stl(ts_1333_res_diff_d_h, s.window = 'periodic')) + 
+    labs(x = 'Дни', title = 'STL для дважды дифференцированного ряда')
+```
+
+По моему мнению все три преобразования сработали примерно одинаково. Поэтому в будущем я буду рассматривать все эти варианты при построении моделей. 
+
+Можно проверить ряды на стационарность [KPSS-тестом](http://www.machinelearning.ru/wiki/index.php?title=Критерий_KPSS) или [ADF-тестом](https://en.wikipedia.org/wiki/Augmented_Dickey–Fuller_test) (Дики-Фуллера). Но они в каждом случае находят ряд стационарным, поэтому здесь приводиться не будут.
+
+```{r include=FALSE}
+library(tseries)
+# ряд остатков
+kpss.test(ts_1333_res)
+adf.test(ts_1333_res)
+
+# продифференцированный по дням ряд остатков
+kpss.test(ts_1333_res_diff_d)
+adf.test(ts_1333_res_diff_d)
+
+# продифференцированный по часам ряд остатков
+kpss.test(ts_1333_res_diff_h)
+adf.test(ts_1333_res_diff_h)
+
+# продифференцированный по дням и по часам ряд остатков
+kpss.test(ts_1333_res_diff_d_h)
+adf.test(ts_1333_res_diff_d_h)
+```
+
+
+### 4. Подберите по начальные приближения для параметров p, q, P, Q {#w3s4}
+
+*Постройте ACF и PACF полученного ряда остатков (возможно, продифференцированных) с максимальным лагом не меньше длины самого длинного сезонного периода (неделя или год), подберите по ним начальные приближения для параметров p,q,P,Q. Используйте эти начальные приближения при переборе моделей ARIMA исходного ряда, не забывая подавать функции SARIMAX регрессионные признаки.*
+
+[Построим графики acf/pacf](#plot_acf_pacf), для удобства возьмем лаги за неделю, а сетку сделаем кратную дням.
+
+График для ряда остатков:
+
+```{r acf_pacf_res, fig.width=10, warning=FALSE, fig.asp=1/3}
+max_lag <- 170 # количество отображаемых лагов
+my_breaks <- seq(0, max_lag, 24) # удобные метки каждые 24 часа
+
+plot_acf_pacf(ts_1333_res, max_lag = max_lag) + 
+    ggtitle('Графики ACF и PACF') + 
+    scale_x_continuous(breaks = my_breaks)
+```
+
+График для ряда остатков дифференцированных по дням:
+
+```{r acf_pacf_d, fig.width=10, warning=FALSE, fig.asp=1/3}
+plot_acf_pacf(ts_1333_res_diff_d, max_lag = max_lag) + 
+    ggtitle('Графики ACF и PACF') + 
+    scale_x_continuous(breaks = my_breaks)
+```
+
+График для ряда остатков дифференцированных по часам:
+
+```{r acf_pacf_р, fig.width=10, warning=FALSE, fig.asp=1/3}
+plot_acf_pacf(ts_1333_res_diff_h, max_lag = max_lag) + 
+    ggtitle('Графики ACF и PACF') + 
+    scale_x_continuous(breaks = my_breaks)
+```
+
+График для ряда остатков дифференцированных по дням и по часам:
+
+```{r acf_pacf_d_f, fig.width=10, warning=FALSE, fig.asp=1/3}
+plot_acf_pacf(ts_1333_res_diff_d_h, max_lag = max_lag) + 
+    ggtitle('Графики ACF и PACF') + 
+    scale_x_continuous(breaks = my_breaks)
+```
+
+В рядах осталось много структуры. По последнему графику можно выбрать `p = 16, P = 6, q = 11, Q = 7`. К сожалению, это не просчитается за адекватное время, поэтому я остановлюсь на этих начальных приблежениях: `p = q = 7, P = Q = 2`. 
+
+
+
+
+### 5. Выберите оптимальную по AIC модель {#w3s5}
+
+*Выберите оптимальную по AIC модель; постройте график исходного ряда и нарисуйте поверх предсказания выбранной модели. Если модель плохо описывает данные, попробуйте увеличить количество синусов и косинусов K или поменять порядки дифференцирования.*
+
+Для выбора лучшей модели воспользуемся функцией `auto.arima`, которая "умно" ищет возможные варианты (в отличии от python не надо писать циклы перебора). Это выполняется командой: 
+
+```{r eval=FALSE}
+model <- auto.arima(ts_1333, trace = TRUE, xreg = xreg,
+                    max.p = 7, max.q = 7, max.P = 2, max.Q = 2,
+                    max.d = 2, max.D = 1)
+```
+
+По словам автора библиотеки `forecast` поиск порядка сезонного дифференцирования не совершенен, поэтому перебор производился четыре раза, в каждом из которых явно зададим порядки дифференцирования. Здесь не будут приводится логи выполнения поиска т.к. они продолжаются значительное время и часть из них я делал в облаке. Лучшие модели из каждого запуска (все комбинации дифференцирования):
+
+```
+ARIMA(2,0,0)(1,0,0)[24]
+ARIMA(3,1,0)(2,0,0)[24]
+ARIMA(2,0,0)(2,1,0)[24]
+ARIMA(6,1,4)(2,1,0)[24]
+```
+
+Пересчитаем модели и выведем информацию:
+
+```{r models, cache=TRUE}
+model_nodiff <- Arima(ts_1333, xreg = xreg,
+                      order = c(2, 0, 0), seasonal = c(1, 0, 0))
+model_d <- Arima(ts_1333, xreg = xreg,
+                 order = c(2, 0, 0), seasonal = c(2, 1, 0))
+model_h <- Arima(ts_1333, xreg = xreg,
+                 order = c(3, 1, 0), seasonal = c(2, 0, 0))
+model_d_h <- Arima(ts_1333, xreg = xreg,
+                   order = c(6, 1, 4), seasonal = c(2, 1, 0))
+```
+
+```{r}
+# выведем скорректированные AIC
+c(model_nodiff$aicc, model_h$aicc, model_d$aicc, model_d_h$aicc)
+
+# выведем данные по ошибкам моделей
+accuracy(model_nodiff) %>% round(5)
+accuracy(model_h) %>% round(5)
+accuracy(model_d) %>% round(5)
+accuracy(model_d_h) %>% round(5)
+```
+
+Более предпочтительной выглядит модель `ARIMA(6,1,4)(2,1,0)[24]`.
+
+
+Отобразим данные. Скорее всего на этом графике вы ничего не разглядите, поэтому если интересно поведение модели в деталях, можно посмотреть [интерактивную версию](https://beta.rstudioconnect.com/content/2299/viewer-rpubs-85f021090283.html).
+
+```{r actual_fitted_ts, cache=TRUE, fig.asp=1/3, fig.width=10}
+# палитра
+my_pal <- wes_palette(name = "Moonrise2")
+
+# чтобы не плодить переменные, соберем данные на ходу
+data.table(date_time = reg_1333$date, actual = model_d_h$x %>% as.numeric,
+           fitted = fitted(model_d_h) %>% as.numeric) %>% 
+    melt(id.vars = 'date_time', measure.vars = c('actual', 'fitted')) %>%
+    ggplot(aes(x = date_time, y = value, color = variable)) +
+    geom_line(alpha = .5) +
+    scale_color_manual(values = my_pal[c(4, 2)], name="", 
+                       breaks=c("actual", "fitted"), 
+                       labels=c("Исходный ряд", "Модель")) + 
+    labs(y = 'n', x = 'Дата', title = 'Исходный ряд и его модель') + 
+    theme(legend.position="bottom")
+```
+
+
+```{r include=FALSE}
+# интерактивный график
+# library(dygraphs)
+# data.table(date_time = reg_1333$date, `Исходный ряд` = model_d_h$x %>% as.numeric,
+#            `Модель` = fitted(model_d_h) %>% as.numeric) %>%
+#     dygraph() %>% dyOptions(useDataTimezone = TRUE)
+```
+
+
+
+### 6. Проанализируйте качество построенной модели {#w3s6}
+
+*Проанализируйте качество построенной модели. Опишите, в какие периоды она плохо описывает данные? Можно ли заранее предсказать её поведение в такие периоды и улучшить тем самым прогноз? Если да, попробуйте создать для таких периодов регрессионные признаки и вернитесь к пункту 2.*
+
+Вообще, модель ведет себя более-менее адекватно. Если немного внимательнее посмотреть на график, то модель может сильно ошибаться не только в аномальные дни (что-то случилось), но и 2 января, 12-14 марта и т.п., когда начинает предсказывать отрицательные значения (что нетрудно устраняется уже после прогноза). Чтобы улучшить модель, я попробовал добавить больше синусов-косинусов, а так же [ввести бинарные переменные](#get_wday_dummy) по дням недели. Проведя поиски, описанные выше была рассчитана модель `ARIMA(2,1,1)(1,0,1)[24]`.
+
+```{r new_model, cache=TRUE}
+# 14 синокосов
+xreg <- get_xreg(k = 14, to = nrow(reg_1333))
+# фактор дня недели
+xreg_14_day <- cbind(xreg, get_wday_dummy(reg_1333[,date]))
+# обучим модель
+model_best <- Arima(ts_1333, xreg = xreg_14_day,
+                    order = c(2, 1, 1), seasonal = c(1, 0, 1))
+```
+
+По сравнению с лучшей моделью найденной выше, у новой меньше средние абсолютная и средне-квадратическая ошибки.
+
+```{r compare_models}
+accuracy(model_best) %>% round(5)
+accuracy(model_d_h) %>% round(5)
+```
+
+
+Отобразим на графике предсказания модели за первую неделю июня. Обучающую выборку и предсказания можно посмотреть на [интерактивном графике](https://beta.rstudioconnect.com/content/2301/viewer-rpubs-85f06fb1ec26.html).
+
+Подготовим таблицу для графика:
+
+```{r model_forecast}
+# переменные для предсказания
+my_model <- model_best
+h <- 168 
+reg_1333_fc <- reg_1333_all[date >= as.Date('2016-06-01')][1:h]
+rows_fc <- (nrow(reg_1333) + 1):(nrow(reg_1333) + h)
+
+# регрессоры для модели
+xreg_fc <- cbind(get_xreg(k = 14, from = nrow(reg_1333) + 1,
+                          to = nrow(reg_1333) + h),
+                 get_wday_dummy(reg_1333_fc[,date]))
+
+# прогноз
+fc <- forecast(my_model, xreg = xreg_fc, h = h)
+
+# таблица с прогнозом и обучаеющей выборкой
+dt_fc <- rbindlist(list(reg_1333, reg_1333_fc))
+dt_fc <- dt_fc[rows_fc, `:=`(pred = fc$mean %>% as.numeric, 
+                    lower = fc$lower[,1] %>% as.numeric, 
+                    upper = fc$upper[,1] %>% as.numeric)]
+dt_fc <- dt_fc[1:nrow(reg_1333), pred := fitted(my_model)]
+```
+
+Как видно из графика, кое-где модель довольно сильно ошибается, хотя чаще всего предсказанные значения находятся в пределах доверительного интервала (здесь он 80%):
+
+```{r plot_predict, fig.asp=1/3, fig.width=10}
+ggplot(dt_fc[!is.na(lower)]) + 
+    geom_ribbon(aes(ymin = lower, ymax = upper, x = date), 
+                fill = my_pal[3], alpha = 0.2) + 
+    geom_line(aes(x = date, y = pred, color = 'pred'), alpha = 0.9) +
+    geom_line(aes(x = date, y = n, color = 'actual'),  alpha = 0.9) + 
+    labs(x = 'Дата', y = 'n', title = 'Ряд и его предсказание') + 
+    scale_colour_manual(name = '', 
+                        values =c('pred' = my_pal[3], 'actual' = my_pal[1]), 
+                        labels = c('Исходный ряд','Предсказания')) +
+    theme(legend.position="bottom")
+```
+
+
+### 7. Опубликуйте ноутбук {#w3s7}
+
+Ноутбук опубликован на [rstudioconnect.com](https://beta.rstudioconnect.com/content/2298/taxi03.html). Файлы проекта также можно найти и на [гитхабе](https://github.com/yurkai/taxi).
+
+
+### 8. Приложение: код функций {#w3s8}
+
+##### 8.1 raw_to_agg
+
+Эта функция обрабатывает сырые данные, после чего каждый месяц уже будет разбит на регионы и из каждого будет проставлено количество поездок.
+
+```{r raw_to_agg}
+############################################################
+# все файлы из folder_in обрабатываются и записываются в folder_out
+
+raw_to_agg <- function(verbose = TRUE) {
+    # папки и паттерн
+    folder_in <- 'data_in' 
+    folder_out <- 'data_out'
+    yt_pattern <- 'yellow_tripdata_'
+    
+    # засечем время
+    start <- now()
+    
+    # имена файлов с данными
+    files_in <- list.files(paste(getwd(), folder_in, sep = '/'))
+    files_in <- files_in[grep(yt_pattern, files_in)]
+    files_out <- sub(yt_pattern, '', files_in)
+    
+    if (verbose) paste('файлов:', length(files_in)) %>% cat
+    
+    # загружаем файлы и сохраняем обработанные
+    for (i in seq_along(files_in)) {
+        # с какими файлами работаем
+        filename_in <- paste(getwd(), folder_in, files_in[i], sep = '/')
+        filename_out <- paste(getwd(), folder_out, files_out[i], sep = '/')
+        if (verbose) paste0('\nфайл[', i, ']: ', files_in[i]) %>% cat
+        
+        # обработка
+        dt_month <- fread(filename_in) # чтение
+        dt_month <- clear_data(dt_month) # очистка таблицы
+        dt_month <- make_regions(dt_month) # присвоение регионов
+        dt_agg <- get_dt_agg_with_zeroes(dt_month) # агрегация по регионам
+        # исправим время и удалим ненужные колонки
+        dt_agg[, `:=`(date = paste(year, month, day, hour) %>% ymd_h,
+                      year = NULL, month = NULL, day = NULL, hour = NULL)]
+        fwrite(dt_agg, filename_out)
+        if (verbose) cat(' ... ок')
+    }
+    
+    if (verbose) paste('\nвремя обработки', 
+                       round(as.numeric(now() - start, units = 'mins'), 1), 
+                       'минут') %>% cat
+    
+}
+```
+
+
+##### 8.2 read_regions
+
+```{r read_regions}
+############################################################
+# читаются зоны regions_to_read из файлов в папки folder_out
+
+read_regions <- function(regions_to_read, verbose = TRUE) {
+    
+    folder <- 'data_out'
+    files <- list.files(paste(getwd(), folder, sep = '/')) %>%
+        paste(getwd(), folder, ., sep = '/')
+    dt <- data.table()
+    
+    # засечем время
+    start <- now()
+    
+    if (verbose) paste('файлов:', length(files), '\n') %>% cat
+    
+    for (filename in files){
+        cat('. ')
+        dt_agg <- fread(filename)
+        dt_agg[, date := parse_date_time(date, "YmdHMS")]
+        dt_agg <- dt_agg[region %in% regions_to_read] %>% 
+            dcast(date ~ region, value.var = 'n')
+        dt <- rbindlist(list(dt, dt_agg), use.names = TRUE)
+        
+    }
+    
+    setkey(dt, date)
+    
+    if (verbose) paste('\nвремя обработки', 
+                       round(as.numeric(now() - start, units = 'secs'), 1), 
+                       'сек') %>% cat
+    
+    dt
+}
+```
+
+
+##### 8.3 get_xreg
+
+```{r}
+############################################################
+# создаем регрессионные признаки из синусов и косинусов
+# k -- количество синусов/косинусов
+# from, to -- номер периода
+# fun - функция для тренда
+# trend -- включать ли тренда
+# weeks -- включать ли недельные признаки
+# years -- включать ли годовые признаки
+
+get_xreg <- function(k = 2, from = 1, to, fun = function(x) x,
+                     trend = FALSE, weeks = TRUE, years = FALSE) {
+    
+    dt <- data.table(idx = from:to)
+    
+    # добавляем тренд
+    if (trend) dt <- dt[,trend := fun(idx)] 
+    
+    for (i in 1:k){
+        vars_week <- paste0(c('week_s_', 'week_c_'), i)
+        vars_year <- paste0(c('year_s_', 'year_c_'), i)
+        
+        # добавляем недели
+        if (weeks){
+            dt[, vars_week[1] := sin(i * idx * 2*pi / 168)]
+            dt[, vars_week[2] := cos(i * idx * 2*pi / 168)]
+        }
+        
+        # добавляем годы
+        if (years){
+            dt[, vars_year[1] := sin(i * idx * 2*pi / 8766)]
+            dt[, vars_year[2] := cos(i * idx * 2*pi / 8766)]
+        }
+    }
+    
+    # сортируем колонки по именам, чтобы удобнее смотреть
+    setcolorder(dt, colnames(dt) %>% sort)
+    
+    dt[, -c('idx')]
+}
+```
+
+
+
+##### 8.4 plot_acf_pacf
+
+```{r}
+############################################################
+# в связи с новым жжплотом сейчас (12/2016) не отображается
+# pacf в autoplot. поэтому придется переписать функцию
+# построения графиков, чтобы все было в одном стиле
+# расчет интервалов взят из stats::plot_acf
+
+plot_acf_pacf <- function(my_ts, max_lag = 36, ci = 0.95, fill_clr = 'coral'){
+    # получаем автокорреляционные функции
+    my_acf <- acf(my_ts, lag.max = max_lag, plot = FALSE)
+    my_pacf <- pacf(my_ts, lag.max = max_lag, plot = FALSE)
+    # рассчитываем доверительные интервалы
+    ci <- 0.95
+    clim0 <- qnorm((1 + ci)/2)/sqrt(my_acf$n.used)
+    clim_acf <- clim0 * sqrt(cumsum(2 * my_acf$acf[-1, 1, 1]^2))
+    clim_pacf <- clim0 * sqrt(cumsum(2 * my_pacf$acf[, 1, 1]^2))
+    
+    # табличка с интервалами
+    dt_ci <- data.table(lag = rep(1:max_lag, 2), ci = c(clim_acf, clim_pacf),
+                        variable = c(rep('acf', max_lag), rep('pacf', max_lag)))
+    
+    # таблица со значениями acf/pacf
+    dt <- data.table(
+        lag = 1:max_lag, 
+        acf = tail(my_acf$acf, -1),
+        pacf = my_pacf$acf[,1,1]) %>% 
+        melt(id.vars = 'lag', value.var = c('acf', 'pacf'))
+
+    # сам график
+    ggplot(dt, aes(x = lag, y = value)) + 
+        facet_grid(variable~., switch = 'y') +
+        geom_ribbon(data = dt_ci, aes(x = lag, y= 0, ymin = -ci, ymax = ci), 
+                    fill = fill_clr, alpha = 0.3) + 
+        geom_point(data = dt, aes(x = lag, y = value), size = .5) + 
+        geom_errorbar(data = dt, aes(x = lag, ymin = 0, ymax = value),
+                      width = 0.1) + 
+        labs(y = '', title = '')
+}
+```
+
+
+
+
+##### 8.5 get_wday_dummy
+
+```{r get_wday_dummy}
+############################################################
+# сделать дамми-признаки из дат (только 6 столбцов)
+
+# date_time -- вектор с датами
+get_wday_dummy <- function(date_time, drop_first = TRUE){
+    cols <- ifelse(drop_first, 2, 1):7 # номера колонок
+    (data.table(day = factor(wday(date_time), labels = 1:7)) %>%
+        model.matrix(~ 0 + day, .))[,-7]
+}
+```
+
+
