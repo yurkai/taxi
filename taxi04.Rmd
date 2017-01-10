@@ -1,0 +1,501 @@
+---
+title: "Желтое такси в Нью-Йорке"
+output:
+  html_document: 
+    toc: yes
+  html_notebook: default
+---
+
+*Задача этого проекта — научиться предсказывать количество поездок в ближайшие часы в каждом районе Нью-Йорка. Для того, чтобы её решить, сырые данные необходимо агрегировать по часам и районам. Агрегированные данные будут представлять собой почасовые временные ряды с количествами поездок из каждого района. Похожие задачи возникают на практике, если вам необходимо спрогнозировать продажи большого количества товаров в большом количестве магазинов, объём снятия денег в сети банкоматов, посещаемость разных страниц сайта и т.д.*
+
+# Неделя 3: Прогнозирование большого количества рядов {#week04}
+
+### 0. Вступление и подготовка к работе {#w4s0}
+
+Авторы проекта предложили использовать инструмент на выбор. Т.к. для меня это второй проект, то я решил его сделать на R. Ввиду того, что в специализации используется Python, я постарался снабдить код подробными комментариями, чтобы (при желании) было легче разобраться.
+
+Ссылки на прошлые недели: [Неделя 1](https://beta.rstudioconnect.com/content/2211/taxi01.html), [Неделя 2](https://beta.rstudioconnect.com/content/2218/taxi02.html), [Неделя 3](https://beta.rstudioconnect.com/content/2298/taxi03.html).
+
+Для работы потребуются следующие библиотеки и файлы:
+
+```{r libs, message=FALSE}
+library(wesanderson) # палитры для графиков
+library(scales) # в помощь графикам
+library(ggplot2) # графики
+library(magrittr) # c'est ne pas une pipe
+library(lubridate) # работа с датами
+library(forecast) # предсказания рядов
+library(cluster) # для кластеризации
+library(data.table) # работа с таблицами данных
+library(assertthat) # проверки
+
+source('helpers03.R') # здесь вспомогательные функции
+source('helpers04.R') # здесь вспомогательные функции
+
+# Sys.setlocale('LC_ALL','utf-8') # если неверно отображается кириллица
+```
+
+Информация о версиях библиотек и системе:
+
+
+```{r versions}
+sessionInfo()
+```
+
+
+
+### 1. Подготовьте данные {#w4s1}
+
+*Составьте из данных о поездках прямоугольную таблицу так, чтобы по строкам было время, а по столбцам идентификатор ячейки (возьмите только те, которые были отобраны на второй неделе). Не используйте данные за последние имеющиеся месяцы — май и июнь 2016!*
+
+Пересохраним данные по 102 регионам в отдельную таблицу, которой и будем пользоваться, отфильтруем по датам и выведем хвостик первых 6 регионов:
+
+```{r eval read_regions, cache=TRUE}
+# наши регионы
+regions_102 <- c(1075, 1076, 1077, 1125, 1126, 1127, 1128, 1129, 1130, 1131, 
+                 1132, 1172, 1173, 1174, 1175, 1176, 1177, 1178, 1179, 1180, 
+                 1181, 1182, 1183, 1184, 1221, 1222, 1223, 1224, 1225, 1227, 
+                 1228, 1229, 1230, 1231, 1232, 1233, 1234, 1235, 1272, 1273, 
+                 1274, 1278, 1279, 1280, 1281, 1282, 1283, 1284, 1285, 1286, 
+                 1287, 1326, 1327, 1331, 1332, 1333, 1334, 1335, 1336, 1337, 
+                 1338, 1339, 1376, 1377, 1378, 1380, 1382, 1383, 1384, 1385, 
+                 1386, 1387, 1388, 1389, 1390, 1426, 1431, 1434, 1435, 1436, 
+                 1437, 1438, 1439, 1441, 1442, 1480, 1482, 1483, 1530, 1532, 
+                 1533, 1580, 1630, 1684, 1733, 1734, 1783, 2068, 2069, 2118, 
+                 2119, 2168)
+
+# загрузим данные по регионам из агрегированных файлов и сохраним отдельно
+# regions_all <- read_regions(regions_102)
+# colnames(regions_all)[2:103] <- paste0('r', colnames(regions_all[,-1]))
+# fwrite(regions_full, 'data_out/regions_102_2013-2016.csv')
+
+# загрузим данные по 102 регионам
+data_full <- fread('data_out/regions_102_2013-2016.csv')
+data_full <- data_full[, date := parse_date_time(date, "YmdHMS")]
+data_102 <- data_full[date < ymd('2016-05-01') & date >= ymd('2016-04-01')]
+tail(data_102[, 1:7])
+```
+
+
+### 2. Стандартизуйте столбцы {#w4s2}
+
+*Перед проведением кластеризации стандартизуйте столбцы (вычтите выборочное среднее и поделите на выборочную дисперсию). Это необходимо, поскольку при выборе модели ARIMA имеет значение только форма ряда, но не его средний уровень и размах колебаний.*
+
+Вот как выглядят нормализованные данные:
+
+```{r scale_data, cache=TRUE}
+scaled_102 <- scale(data_102[,-1])
+head(scaled_102[,1:6])
+```
+
+
+### 3. Кластеризуйте географические зоны {#w4s3}
+
+*Кластеризуйте географические зоны по значениям стандартизованных рядов. Подберите число кластеров так, чтобы оно было не слишком большим, но ряды внутри кластеров имели похожую форму. Постройте графики стандартизованных рядов каждого кластера, чтобы в этом убедиться.*
+
+Попробуем определить оптимальное количество кластеров. Посчитаем среднее значение силуэта для при количестве кластеров от 2 до 20 для алгоритмов [k-means](https://en.wikipedia.org/wiki/K-means_clustering), [PAM](https://en.wikipedia.org/wiki/K-medoids) и [hclust](https://en.wikipedia.org/wiki/Hierarchical_clustering) (иерархической кластеризации).
+
+```{r clusters_num, cache=TRUE}
+max_cl <- 20
+dist_eucl <- dist(t(scaled_102), method = "euclidean")
+sil <- rep(0, max_cl)
+avr_sil <- data.table(clusters = seq_len(max_cl))
+
+set.seed(19)
+# kmeans
+for(i in 2:max_cl){
+    kmeans_cl <- kmeans(t(scaled_102), centers = i, nstart = 5)
+    sil[i] <- mean(silhouette(kmeans_cl$cluster, dist_eucl)[, 3])
+}
+avr_sil <- cbind(avr_sil, kmeans = sil)
+
+# pam
+for(i in 2:max_cl){
+    pam_cl <- pam(t(scaled_102), i)
+    sil[i] <- mean(silhouette(pam_cl$clustering, dist_eucl)[, 3])
+}
+avr_sil <- cbind(avr_sil, pam = sil)
+
+# hclust
+hc <- hclust(dist_eucl, method = "ward.D2" )
+for(i in 2:max_cl){
+    sil[i] <- mean(silhouette(cutree(hc, k = i), dist_eucl)[, 3])
+}
+avr_sil <- cbind(avr_sil, hclust = sil)
+```
+
+Отобразим результаты:
+
+```{r n_clust_plot, fig.asp=1/3, fig.width=10}
+melt(avr_sil, id.vars = 'clusters', measure.vars = c('kmeans', 'pam', 'hclust')) %>%
+    ggplot(aes(clusters, value)) + 
+    geom_line(color = 'gray70') + geom_point() +
+    facet_wrap(~variable) + 
+    scale_x_continuous(breaks = seq_len(max_cl), minor_breaks = FALSE) + 
+    labs(title ='Средний силуэт для 3 алгоритмов кластеризации',
+         x = 'Количество кластеров', y = 'Средний силуэт')
+```
+
+Как видно из графиков, наиболее оптимальное количество кластеров -- 2 или 3, что не очень нам подходит. У этих данных нет ярко выраженной кластерной структуры. Другие методы определения оптимального количества кластеров (например, метод локтя) или другой метрики расстояния (например, корреляции) не дали лучших результатов, поэтому здесь не приводятся. Выберем количество кластеров равно 12 и воспользуемся иерархической кластеризацией. Посмотрим, сколько элементов в каждом кластере:
+
+```{r clustering, cache=TRUE}
+n_clusters <- 12
+dist_eucl <- dist(t(scaled_102), method = "euclidean")
+hc <- hclust(dist_eucl, method = "ward.D2" )
+reg_clust <- data.table(region = colnames(scaled_102),
+                        cluster = cutree(hc, k = n_clusters))
+reg_clust[, .N, by = cluster]
+```
+
+
+### 4. В каждом кластере выберите наиболее типичный ряд {#w4s4}
+
+*Например, это может быть ряд, соответствующий центру кластера.*
+
+Выберем наиболее типичным рядом внутри кластера тот, у которого корреляция с остальными рядами внутри кластера больше:
+
+```{r avr_ts_scaled, cache=TRUE, fig.asp=1, fig.width=10, warning=FALSE}
+# составляем список с рядами, внутри каждого кластера
+cl_names <- paste0('cluster_', seq_len(n_clusters))
+regs_in_cl <- sapply(seq_len(n_clusters), 
+                     function(j) reg_clust[cluster == j, region])
+names(regs_in_cl) <- cl_names
+
+# для каджого ряда посчитаем средние значения корреляцию с остальными рядами
+# выберем тот ряд, у которого средняя корреляция наибольшая
+# это и будем считать типичным рядом кластера
+typical_regs <- c()
+for (idx_cl in seq_len(length(regs_in_cl))){
+    cor_m <- data_102[, regs_in_cl[[idx_cl]], with = FALSE] %>% cor %>% data.table
+    sapply(regs_in_cl[[idx_cl]] %>% length %>% seq_len, 
+           function(k) rowMeans(cor_m[k, -k, with=FALSE])) %>%
+        which.max %>% regs_in_cl[[idx_cl]][.] -> typical_regs[idx_cl]
+}
+
+# вот эти ряды будут представлять свой кластер
+typical_regs
+
+typical_series <- data_102[,..typical_regs]
+
+# отобразим графики
+(typical_series %>% scale %>% data.table)[, lapply(.SD, function(x) 
+    # считаем скользяшки, чтобы график был опрятнее
+    rollmean(x, 12, na.pad = TRUE, align = 'right'))] %>%
+    # добавляем дату
+    cbind(data_102[,.(date)], .) %>%
+    # переводим в длинный вид
+    melt(id.vars = 1, measure.vars = (seq_len(n_clusters) + 1) ) %>%
+    # отображаем
+    ggplot(aes(date, value)) + geom_line() +
+    facet_grid(variable~., switch = 'y') +
+    labs(title ='Типичные ряды кластеров',
+         x = 'Дата', y = 'Значение (нормированное)')
+```
+
+
+
+### 5. Подберите на исходных рядах оптимальную структуру моделей {#w4s5}
+
+*Для выбранных географических зон подберите на исходных рядах оптимальную структуру моделей — набор регрессионных признаков и значения гиперпараметров p,d,q,P,D,Q — так, как это делалось на прошлой неделе. Не используйте данные за последний имеющийся месяц — май и июнь 2016!*
+
+Настроим модели для каждого из типичных рядов. Эти вычисления проводились в облаке и заняли довольно продолжительное время. Функция подбора модели `auto.arima()` использует одно ядро (при "умном" поиске), поэтому можно задействовать другие ядра, распараллелив вычисления:
+
+```{r eval=FALSE}
+# считаем в параллели
+library(parallel)
+
+# столько ядер в кластере
+n_cores <- detectCores() # 4
+
+# регрессоры для моделей
+n_xreg <- 49
+xreg <- get_xreg(n_xreg, 1, nrow(data_102))
+
+# засечем время
+start <- Sys.time()
+
+# сюда складываем модели
+models <- list()
+
+# объявляем кластер
+cl <- makeCluster(n_cores, outfile ='log.txt')
+
+# видимые кластеру переменные и либы 
+my_var <- c('data_102', 'xreg', 'typical_regs', 'models')
+clusterExport(cl, my_var)
+clusterEvalQ(cl, library(forecast))
+
+# считаем аримы
+parLapply(cl, 
+          typical_regs, 
+          function(region){
+            ts_cl <- ts(data_102[[region]], start = 1, frequency = 24)
+            fit <- auto.arima(ts_cl, xreg = xreg, trace = TRUE)
+            cat(region, fill = TRUE)
+            
+            fit
+          }) -> models
+
+# останавливаем кластер 
+stopCluster(cl)
+finish <- Sys.time()
+finish - start
+
+# Time difference of 11.95771 hours
+
+saveRDS(models, 'data_out/models.rds')
+```
+
+Загрузим сохраненные модели:
+
+```{r load_models}
+n_xreg <- 49
+models <- readRDS('data_out/models.rds')
+# выведем параметры
+sapply(models, nice_arima_print)
+```
+
+
+### 6. Настройте модель, посчитайте ошибку прогноза для каждой зоны на данных по маю 2016 {#w4s6}
+
+*Для каждой из R географических зон настройте на данных до апреля 2016 включительно модель ARIMA с гиперпараметрами, соответствующими кластеру этой зоны. Для каждого конца истории от 2016.04.30 23:00 до 2016.05.31 17:00 постройте прогноз на 6 часов вперёд и посчитайте в ноутбуке ошибку прогноза по следующему функционалу:*
+
+$$Q_{may} = \frac{1}{R*739*6} \sum_{r=1}^{R} \sum_{T=2016.04.30\ 23:00}^{2016.05.31\ 17:00}\sum_{i=1}^{6}|\hat{y}_{T|T+i}-y_{T+i}^{r}|  $$
+
+[Сделаем](#get_pred_region_h) прогноз ипользуя рассчитанные модели. На прогноз одного региона уходит примерно минута.
+
+```{r eval=FALSE}
+freq <- 24
+start_date <- ymd('2016-04-01')
+end_date <- ymd_h('2016-04-30 23')
+end_date_test <- ymd_h('2016-05-31 17')
+
+tbls <- list() # сюда сохраняем
+
+for (idx_cl in seq_len(n_clusters)) {
+    fit <- models[[idx_cl]]
+    regions <- regs_in_cl[[idx_cl]]
+    print(regions)
+    tbls[[idx_cl]] <- lapply(
+        regions,
+        function(region){
+            get_pred_region_h(region, fit, start_date,
+                              end_date, end_date_test)
+            })
+}
+
+# развернем список в одну таблицу и сохраним
+pred_may_6 <- lapply(tbls, rbindlist) %>% rbindlist
+fwrite(pred_may_6, 'data_out/pred_may.csv')
+```
+
+Рассчитаем [ошибку](#get_q):
+
+```{r may_mae, cache=TRUE}
+pred_may_6 <- fread('data_out/pred_may.csv')
+get_Q(pred_may_6)
+```
+
+
+### 7. Настройте модель, посчитайте ошибку прогноза для каждой зоны на данных по июню 2016 {#w4s7}
+
+*Для каждой из R географических зон настройте на данных до мая 2016 включительно модель ARIMA с гиперпараметрами, соответствующими кластеру этой зоны. Для каждого конца истории от 2016.05.31 23:00 до 2016.06.30 17:00 постройте прогноз на 6 часов вперёд и запишите все прогнозы в файл в формате `id,y`, где столбец `id` состоит из склеенных через подчёркивание идентификатора географической зоны, даты конца истории, часа конца истории и номера отсчёта, на который делается предсказание (1-6); столбец `y` — ваш прогноз.*
+
+$$ Q_{june} = \frac{1}{R*715*6} \sum_{r=1}^{R} \sum_{T=2016.05.31\ 23:00}^{2016.06.30\ 17:00}\sum_{i=1}^{6}|\hat{y}_{T|T+i}-y_{T+i}^{r}|  $$
+
+```{r eval=FALSE}
+start_date <- ymd('2016-04-01')
+end_date <- ymd_h('2016-05-31 23')
+end_date_test <- ymd_h('2016-06-30 17')
+
+tbls <- list() # сюда сохраняем
+
+for (idx_cl in seq_len(n_clusters)) {
+    fit <- models[[idx_cl]]
+    regions <- regs_in_cl[[idx_cl]]
+    print(regions)
+    tbls[[idx_cl]] <- lapply(
+        regions,
+        function(region){
+            get_pred_region_h(region, fit, start_date,
+                              end_date, end_date_test)
+            })
+}
+
+# развернем список в одну таблицу и сохраним
+pred_june_6 <- lapply(tbls, rbindlist) %>% rbindlist
+fwrite(pred_june_6, 'data_out/pred_june.csv')
+```
+
+Можем сами рассчитать ошибку:
+
+```{r june_mae, cache=TRUE}
+pred_june_6 <- fread('data_out/pred_june.csv')
+get_Q(pred_june_6)
+```
+
+
+
+### 8. Загрузите прогноз на kaggle {#w4s8}
+
+*Загрузите полученный файл на kaggle: https://inclass.kaggle.com/c/yellowtaxi. Добавьте в ноутбук ссылку на сабмишн.*
+
+![Мой первый сабмит](data_out/my_disgrace.png)
+
+### 9. Опубликуйте ноутбук (+выводы) {#w4s9}
+
+Ноутбук опубликован на [rstudioconnect.com](https://beta.rstudioconnect.com/content/2343/taxi04.html). Файлы проекта также можно найти и на [гитхабе](https://github.com/yurkai/taxi).
+
+Модель показала очень посредственный результат. Я связываю это с тем, что в моделях добавлено много регрессоров (по 49 синусов и косинусов), что привело к тому, что модели очень долго рассчитывались, поэтому пришлось взять данные всего по одному месяцу. В последующем, я планирую улучшить модели для прогноза временных рядов.
+
+### 10. Приложение: код функций {#w4s10}
+
+##### 10.1 nice_arima_print
+
+```{r}
+# ARIMA(p,d,q)(P,D,Q)[per]  
+# параметры моделей
+nice_arima_print <- function(fit){
+    info <- setNames(fit$arma, c("p", "q", "P", "Q", "m", "d", "D"))
+    paste0('ARIMA(', info[1], ',', info[6], ',', info[2], ')(',
+           info[3], ',', info[7], ',', info[4], ')[', info[5], ']')
+}
+```
+
+##### 10.2 predict_h
+
+```{r}
+# прогноз на 1-h часов
+predict_h <- function(fit, ts_fit, xreg_fit, xreg_h, h = 6){
+    assert_that(h == nrow(xreg_h))
+    assert_that(length(ts_fit) == nrow(xreg_fit))
+    
+    # рефит
+    refit <- Arima(ts_fit, model=fit, xreg = xreg_fit)
+    
+    # прогноз
+    fc <- forecast(refit, xreg = xreg_h)$mean
+    # ограничиваем снизу нулем
+    fc[fc < 0] <- 0
+    
+    fc
+}
+```
+
+
+##### 10.3 get_subm_ymdh
+
+```{r}
+# кусочек строки, где часы одна или две цифры
+get_subm_ymdh <- function(timedate){
+    paste(format(timedate, '%F'), hour(timedate), sep = '_')
+}
+```
+
+
+##### 10.3 get_end
+
+```{r}
+# получить конец истории как в end(td) 
+# n - число наблюдений, freq - частота
+get_end <- function(n, freq = 24){
+    c((n-1) %/% 24 + 1, (n-1) %% 24 + 1)
+}
+```
+
+
+##### 10.4 get_pred_region_h
+
+```{r}
+# получить предсказания для текущего региона на 1:h шагов
+# data_full -- глобальная
+# freq -- глобальная (=24)
+get_pred_region_h <- function(region, fit, start_date, end_date, end_date_test,
+                              h = 6){
+
+    # ts_reg <- полный ряд по региону (с тестовыми данными в том числе)
+    ts_reg <- ts(data_full[date >= start_date, region, with = FALSE][[1]], 
+                 start = 1, frequency = 24)
+    # находим конец первой истории
+    end_iter <- get_end(data_full[date >= start_date & date <= end_date, .N])
+    
+    # определяем количество историй
+    n_max <- data_full[date >= end_date & date <= end_date_test, .N]
+    
+    # таблица для результатов
+    predict_table <- data.table(id = character(), y = numeric())
+    
+    # всего нам потребуется вот столько шагов для регрессоров
+    n_xreg_steps <- data_full[date >= start_date & 
+                                  date <= end_date_test, .N] + h
+    xreg <- get_xreg(n_xreg, 1, n_xreg_steps)
+    
+    # для каждого конца истории считаем от 1 до h предсказаний
+    for (n in seq_len(n_max)){
+        # дата конца текущей истории
+        end_hist <- data_full[which(data_full[,date] == end_date)-1 + n, date]
+        
+        # ряд-итератор
+        ts_iter <- window(ts_reg, end = end_iter[1] + 
+                              (end_iter[2]-1 + n-1)/freq)
+        xreg_fit <- xreg[1:length(ts_iter)]
+        xreg_h <- xreg[(length(ts_iter)+1):(length(ts_iter)+h)]
+        
+        # считаем прогноз
+        pred_р <- predict_h(fit, ts_iter, xreg_fit, xreg_h)
+        
+        # добавляем к таблице прогнозов
+        pred_hist <- data.table(id = paste(substring(region, 2),
+                                           get_subm_ymdh(end_hist),
+                                           1:h, sep = '_'),
+                                y = as.numeric(pred_р))
+        
+        predict_table <- rbindlist(list(predict_table, pred_hist))
+    }
+    
+    predict_table
+}
+```
+
+
+##### 10.5 get_Q
+
+```{r}
+# посчитать функционал ошибки
+# data_full -- глобальная
+get_Q <- function(pred_table){
+    # делаем дату и регион из id
+    tmp <- pred_table[, tstrsplit(id, '_')] %>% cbind(pred_table[,.(id)])
+    tmp[, region := paste0('r', V1)]
+    tmp[, date := ymd_h(paste(V2, V3)) + hours(V4)]
+    
+    # таблица с правильными ответами
+    lookup_table <- melt(data_full, id.vars = 1, 
+                         measure.vars = 2:ncol(data_full),
+                         variable.name = "region", value.name = "n")[
+                             date %in% tmp[, unique(date)]]
+    
+    # теперь в таблице есть и предсказания, и правильные ответы
+    tmp <- merge(tmp, lookup_table, by = c('date', 'region'))
+    tmp <- merge(tmp, pred_table, by = c('id'))
+    
+    # считаем MAE
+    tmp[, mean(abs(n - y))]
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
