@@ -1,0 +1,653 @@
+---
+title: "Желтое такси в Нью-Йорке"
+output:
+  html_document: 
+    toc: yes
+  html_notebook: default
+---
+
+*Задача этого проекта — научиться предсказывать количество поездок в ближайшие часы в каждом районе Нью-Йорка. Для того, чтобы её решить, сырые данные необходимо агрегировать по часам и районам. Агрегированные данные будут представлять собой почасовые временные ряды с количествами поездок из каждого района. Похожие задачи возникают на практике, если вам необходимо спрогнозировать продажи большого количества товаров в большом количестве магазинов, объём снятия денег в сети банкоматов, посещаемость разных страниц сайта и т.д.*
+
+# Неделя 6: Прогнозирование с помощью регрессии {#week05}
+
+### 0. Вступление и подготовка к работе {#w5s0}
+
+Авторы проекта предложили использовать инструмент на выбор. Т.к. для меня это второй проект, то я решил его сделать на R. Ввиду того, что в специализации используется Python, я постарался снабдить код подробными комментариями, чтобы (при желании) было легче разобраться.
+
+Ссылки на прошлые недели: [Неделя 1](https://beta.rstudioconnect.com/content/2211/taxi01.html), [Неделя 2](https://beta.rstudioconnect.com/content/2218/taxi02.html), [Неделя 3](https://beta.rstudioconnect.com/content/2298/taxi03.html). [Неделя 4](https://beta.rstudioconnect.com/content/2343/taxi04.html),
+[Неделя 5](https://beta.rstudioconnect.com/content/2364/taxi05.html).
+
+Для работы потребуются следующие библиотеки и файлы:
+
+```{r libs, message=FALSE}
+library(magrittr) # c'est ne pas une pipe
+library(splusTimeDate) # праздники
+library(lubridate) # работа с датами
+library(Matrix) # работа с матрицами
+library(xgboost) # градиентный бустинг
+library(data.table) # работа с таблицами данных
+
+source('helpers01.R') # здесь вспомогательные функции
+source('helpers03.R') # здесь вспомогательные функции
+source('helpers04.R') # здесь вспомогательные функции
+source('helpers05.R') # здесь вспомогательные функции
+source('helpers06.R') # здесь вспомогательные функции
+
+# Sys.setlocale('LC_ALL','utf-8') # если неверно отображается кириллица
+```
+
+Информация о версиях библиотек и системе:
+
+
+```{r versions}
+sessionInfo()
+```
+
+
+### 1. Загрузите модели и данные прошлой недели {#w6s1}
+
+*Загрузите обучающие выборки прошлой недели, перечислите используемые в моделях признаки и посчитайте качество прогнозов моделей, настроенных на данных до апреля 2016, в мае 2016.*
+
+На 5 неделе было сделано 612 линейных моделей с $L1$ и $L2$ регуляризаторами (по 6 для каждого региона). В сохраненных файлах есть информация по качеству прогноза на май:
+
+```{r week5_models, cache=TRUE}
+files <- list.files('models/', pattern = "\\.rds$")
+
+models <- list() # список для моделей
+tbl_info <- list() # список для таблиц с информацией о них
+
+# аккуратно, в папке должно быть ровно 612 моделей :(
+for (i in seq_along(files)){
+    f <- readRDS(paste0('models/', files[i]))
+    reg <- paste0('r', substr(files[i], 7, 10))
+    j <- substr(files[i], 12, 12) %>% as.integer
+    models[[reg]][[j]] <- f[[1]]
+    tbl_info[[i]] <- f[[2]]
+}
+# составляем табличку с информацией
+tbl_info <- rbindlist(tbl_info)
+tbl_info[, .(mae_train = mean(train), mae_test = mean(test))]
+```
+
+Качество на данных по маю: `MAE = 18.89`. Для модели использовались следующие признаки:
+
+- 49 фурье-компонент, как недельных, так и годовых;
+- дамми-признаки: месяц, день недели, час;
+- взаимодействия признаков час-день недели и час-месяц;
+- лаги целевой переменной по 1-6 часами;
+- скользяцие суммы по целевой переменной за 6, 12, 24 и 168 отсчетов времени.
+
+Обучающая выборка взята с время с 1 января 2013 года до 30 апреля 2016 года.
+
+### 2. Добавьте новые признаки для новой модели {#w6s2}
+
+*Попробуйте добавить признаки. Используйте идеи, которые мы предложили, или какие-то свои. Обучайте обновлённые модели на данных до апреля 2016 включительно и считайте качество новых прогнозов на мае. Удаётся ли вам улучшить качество? Не нужно ли увеличить сложность регрессионной модели?*
+
+На этой неделе я попытаюсь улучшить качество моделей используя следующий план:
+
+- в качестве основного признака я использую предсказания моделей прошлой недели и их лаги на 6, 12, 24, 48, 72, 168 часов, а так же скользящие суммы за 6, 12, 24 и 168 часов;
+
+- целевая переменная: лаги 1-24, 48, 72, 96, 120, 144, 168 часов и скользящие суммы за 6, 12, 24 и 168 часов;
+
+- обучающая выборка взята только по данным за 2016 год;
+
+- 7 недельных фурье-компонент;
+
+- дамми-признаки: месяц, день недели, час;
+
+- [дамми-признаки праздников](#get_holidays) в Нью-Йорке: Новый год, День Мартина Лютера Кинга, День святого Патрика, Пасха, День поминовения, День независимости, День Труда, День Колумба, День ветеранов, День благодарения и Рождество, сюда же добавлены дамми-признаки о снежных бурях в 2015 и 2016 году. Для каждого признака лаги и суммы настраивались индивидуально (подробнее в коде);
+
+- лаги и скользящие суммы из исходных данных: средние продолжительность поездки (в секундах), количество пассажиров, расстояние поездки и стоимость, а также их лаги на 6, 12, 24, 48, 72, 168 часов и скользящие суммы за 6, 12, 24 и 168;
+
+- для каждого горизонта прогноза и региона будет построена своя модель xgboost.
+
+
+```{r new_features, cache=TRUE}
+# преобразуем и сохраним признаким по продолжительности, стоимости
+# количеству пассажиров и расстоянию:
+# data_2016 <- read_aux_regions_102()
+# fwrite(data_2016, 'data_out/regions_102_2016_aux.csv')
+data_2016 <- fread('data_out/regions_102_2016_aux.csv')
+# выведем заголовок для региона 1075
+data_2016[, grep('1075', colnames(data_2016)), with = FALSE] %>% head
+
+# загрузим fitted values и прогнозы моделей из 5 недели
+week_05_pred <- fread('data_out/week05_pred_2016.csv')
+week_05_pred <- week_05_pred[, date := parse_date_time(date, "YmdHMS")]
+
+# заменим отрицательные значения нулем 
+# sum(week_05_pred[, y < 0]) # всего 61408 отрицательных
+week_05_pred <- week_05_pred[y < 0, y := 0]
+head(week_05_pred)
+```
+
+
+```{r load_data, cache=TRUE}
+# загрузим данные по 102 регионам
+data_full <- fread('data_out/regions_102_2013-2016.csv')
+data_full <- data_full[, date := parse_date_time(date, "YmdHMS")]
+# оставим данные с января 2016
+data_full <- data_full[date >= ymd('2016-01-01')]
+
+idx_train <- data_full[date <= ymd_h('2016-04-30 17'), which = TRUE]
+idx_test <- data_full[date >= ymd_h('2016-04-30 23') & 
+                    date <= ymd_h('2016-05-31 17'), 
+                which = TRUE]
+idx_june <- data_full[date >= ymd_h('2016-05-31 23') & 
+                    date <= ymd_h('2016-06-30 17'), 
+                which = TRUE]
+
+# наши регионы
+regions_102 <- c(1075, 1076, 1077, 1125, 1126, 1127, 1128, 1129, 1130, 1131, 
+                 1132, 1172, 1173, 1174, 1175, 1176, 1177, 1178, 1179, 1180, 
+                 1181, 1182, 1183, 1184, 1221, 1222, 1223, 1224, 1225, 1227, 
+                 1228, 1229, 1230, 1231, 1232, 1233, 1234, 1235, 1272, 1273, 
+                 1274, 1278, 1279, 1280, 1281, 1282, 1283, 1284, 1285, 1286, 
+                 1287, 1326, 1327, 1331, 1332, 1333, 1334, 1335, 1336, 1337, 
+                 1338, 1339, 1376, 1377, 1378, 1380, 1382, 1383, 1384, 1385, 
+                 1386, 1387, 1388, 1389, 1390, 1426, 1431, 1434, 1435, 1436, 
+                 1437, 1438, 1439, 1441, 1442, 1480, 1482, 1483, 1530, 1532, 
+                 1533, 1580, 1630, 1684, 1733, 1734, 1783, 2068, 2069, 2118, 
+                 2119, 2168)
+```
+
+Часть признаков будут одинаковыми для все обучающих выборок (для всех регионов и всех горизонтов прогноза). Это фурье-компоненты, дамми-признаки месяца, дня недели, часа, а также дамми-признаки праздников и событий (а также их лаги):
+
+```{r common_features, cache=TRUE, results='hide'}
+# наши горизонты прогноза
+hs <- 1:6
+# колонки для целевой переменной
+ys_names <- paste0('y_', hs)
+target_names <- paste0('n_', regions_102)
+
+# колонки с дополнительными признаками
+features_aux <- c('avr_dur_', 'avr_psngr_', 'avr_dist_', 'avr_tax_')
+
+# фурье-компоненты
+n_xreg <- 7
+xreg <- get_xreg(n_xreg, 1, nrow(data_full), trend = TRUE)
+
+# дамми переменные месяц, день недели, час
+data_time <- data_full[,1]
+data_time[, `:=`(year = year(date),
+                 month = as.factor(month(date)),
+                 wday = as.factor(wday(date)),
+                 hour = as.factor(hour(date)))]
+
+# дамми-праздники
+holidays <- get_holidays(data_full[,.(date)])
+
+# соберем общие признаки вместе
+common_features <- cbind(data_time, xreg, holidays)
+
+# лаги для признаков остальных признаки
+lags <- c(0:24, 48, 72, 96, 120, 144, 168) # целевая переменная
+lags_aux <- c(0:6, 12, 24, 48, 72, 168) # доп признаки
+lags_latter_model <- c(0:6, 12, 24, 48, 72, 168) # прогнозы 5й недели
+```
+
+Остальные признаки удобнее строить сразу перед обучением.
+
+### 3. Постройте прогноз на май {#w6s3}
+
+*Когда вы примете решение остановиться и перестать добавлять признаки, постройте для каждой географической зоны и каждого конца истории от 2016.04.30 23:00 до 2016.05.31 17:00 прогнозы на 6 часов вперёд; посчитайте в ноутбуке ошибку прогноза. Убедитесь, что среднее качество прогнозов увеличилось.*
+
+Обучим модели и проверим качество на майских данных. Во время обучения, будем сохранять количество построенных деревьев для каждой из модели:
+
+```{r eval=FALSE}
+# табличка для прогноза
+tbl_pred <- data.table(region = integer(1),
+                       date = ymd_h('2016-05-31 17'),
+                       h = integer(1),
+                       y = numeric(1),
+                       n = numeric(1))[0] # чтобы не было рядов
+
+# листик для моделек
+models <- replicate(102, list())
+
+# здесь записаны метрики по каждой модели и количество деревьев в модели
+# это пригодится для обучения финальной модели
+results <- data.table(region = rep(regions_102, 6),
+                      h = lapply(1:6, rep, 102) %>% unlist, 
+                      score = -1, iters = 0)
+
+idx <- 0
+for (j in 1:6){
+  data <- make_data(j)
+  
+  for (i in seq_along(regions_102)) {
+      
+    r <- paste0('r', results[i, region]) # для выбора региона
+    
+    # индексы для для разделения выборко
+    idx_train <- data[date <= ymd_h('2016-04-30 17') & region == r,
+                      which = TRUE]
+    idx_test <- data[date >= ymd_h('2016-04-30 23') &
+                       date <= ymd_h('2016-05-31 17')  & region == r,
+                     which = TRUE]
+    # преобразуем в матрицы и развернем факторы
+    train <- sparse.model.matrix(
+      ~ . -date + 0, data[idx_train, -c('region',  ys_names), with = FALSE]) 
+    test <- sparse.model.matrix(
+      ~ . -date + 0, data[idx_test, -c('region',  ys_names), with = FALSE]) 
+    
+    # теперь выборки в формате xgb
+    xgb_train <- xgb.DMatrix(
+      data = train, 
+      label = data[[ys_names[j]]][idx_train])
+    xgb_test <- xgb.DMatrix(
+      data = test, 
+      label = data[[ys_names[j]]][idx_test])
+    
+    # параметры обучения
+    params <- list(max_depth = 8, eta = .05, 
+                   colsample_bytree = 1,
+                   min_child_weight = 10, 
+                   subsample = 0.8,
+                   gamma = 0.08,
+                   objective = "reg:linear",
+                   # objective='count:poisson',
+                   nthread = -1)
+    
+    # чтобы подглядывать за метриками
+    watchlist <- list(train = xgb_train, test = xgb_test)
+    
+    # обучаем регрессов
+    bst <- xgb.train(params, xgb_train, eval_metric = 'mae', nround = 1001,
+                     verbose = 0, watchlist = watchlist, print_every_n = 10,
+                     early_stopping_rounds = 10)
+    
+    # заполняем табличку
+    results[idx, score := bst$best_score]
+    results[idx, iters := bst$best_iteration]
+    results[idx, h := j]
+    results[idx, region := regions_102[i]]
+    
+    # сохраняем модель
+    models[[i]][[j]] <- bst
+    
+    # временная таблица с прогнозами, добавляем в общую
+    dt_fc <- data.table(region = regions_102[i],
+                        date = data[idx_test, date],
+                        h = j,
+                        y = predict(bst, xgb_test),
+                        n =  data[[ys_names[j]]][idx_test])
+    tbl_pred <- rbindlist(list(tbl_pred, dt_fc))
+  }
+}
+
+# преобразуем данные для сабмита
+pred_may <- may01[, .(id = paste(region,
+                                   format(date, '%F'),
+                                   hour(date),
+                                   h,
+                                   sep = '_'),
+                        y = y
+)] 
+
+fwrite(pred_may, 'submissions/03 pred_may.csv')
+fwrite(results, 'xgb_info.csv')
+```
+
+Проверим качество:
+
+```{r pred_may, cache=TRUE}
+pred_may <- fread('submissions/03 pred_may.csv')
+pred_may %>% get_Q
+```
+
+Качество повысилось, по сравнению с предыдущей неделей, ошибка уменьшилась на 2 пункта.
+
+### 4. Постройте прогноз на июнь {#w6s4}
+
+*Переобучите итоговые модели на данных до мая 2016 включительно, постройте прогнозы на июнь для каждого конца истории от 2016.05.31 23:00 до 2016.06.30 17:00*
+
+Для построения финальной модели можно воспользоваться прошлой информацией об обучении моделей. Здесь наибольший интерес представляет колонка `xgb_trees` -- количестве деревьев в каждой из моделей:
+
+```{r}
+xgb_info <- fread('xgb_info.csv')
+head(xgb_info)
+```
+
+Таким образом, обучим финальные модели используя прежние гиперпараметры, а количество деревьев в каждой модели возьмем из таблицы выше. Код полностью аналогичный, поэтому не приводится (а обучение занимает около 2 часов). Единственное отличие состоит в том, что изменятся индексы обучающей выборки, а так же теперь у нас нет тестовой выборки (данные за июнь нам неизвестны), поэтому оценивать качество по `watchlist` надо осторожно, очень легко переобучиться:
+
+```{r eval=FALSE}
+# индексы для для разделения выборко
+idx_train <- data[date <= ymd_h('2016-05-31 17') & region == r,
+                  which = TRUE]
+# 
+# ...
+# 
+# чтобы подглядывать за метриками
+watchlist <- list(train = xgb_train)
+# 
+# ...
+
+# 
+fwrite(pred_june, 'submissions/03 pred_june.csv')
+```
+
+Интересно посмотреть на топ-признаки моделей. Например, топ15 для региона 2168 для модели прогноза на 6 часов:
+
+```{r imp_mat}
+imp_mat <- fread('imp_mat.csv')
+imp_mat[,2:4] <- imp_mat[, lapply(.SD, round, 4), .SDcols=2:4]
+
+imp_mat[1:15]
+```
+
+Как и предполагалась, самым важным признаком оказались предсказания прошлых линейных моделей (lm_lag_0). Интересно то, что важным признаком оказалась дамми-переменная о снежных бурях в январе, которая оттянула на себя часть аномальных значений. 
+
+### 5. Загрузите полученный файл на kaggle {#w6s5}
+
+*Загрузите полученный файл на [kaggle](https://inclass.kaggle.com/c/yellowtaxi).*
+
+Средняя абсолютная ошибка на данных июня составила:
+
+```{r pred_june, cache=TRUE}
+pred_june <- fread('submissions/03 pred_june.csv')
+get_Q(pred_june)
+```
+
+![Мой третий сабмит](data_out/sub_03.png)
+
+### 6. Опубликуйте ноутбук {#w6s6}
+
+Ноутбук опубликован на [rstudioconnect.com](https://beta.rstudioconnect.com/content/2444/taxi06.html). Файлы проекта также можно найти и на [гитхабе](https://github.com/yurkai/taxi).
+
+
+### 7. Приложение: код функций {#w6s7}
+
+
+##### 7.1 get_holidays
+
+```{r}
+# праздники и события с лагами и лидами
+get_holidays <- function(tbl) {
+    years <- tbl[, year(date) %>% unique]
+    
+    # new year
+    tbl[, new_year := 0]
+    tbl[date(date) %in% (holiday.NewYears(years) %>% mdy), new_year := 1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(new_year)], 1:3, 1:3))
+    
+    # martin luter king
+    tbl[, mlk := 0]
+    tbl[date(date) %in% (holiday.MLK(years) %>% mdy), mlk := 1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(mlk)], 1, 0))
+    
+    # st_patric
+    tbl[, st_patrics := 0]
+    tbl[date(date) %in% (holiday.StPatricks(years) %>% mdy), st_patrics := 1]
+    
+    # easter
+    tbl[, easter := 0]
+    tbl[date(date) %in% (holiday.Easter(years) %>% mdy), easter := 1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(easter)]))
+    
+    # memorial
+    tbl[, memorial := 0]
+    tbl[date(date) %in% (holiday.Memorial(years) %>% mdy), memorial := 1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(memorial)]))
+    
+    # independence
+    tbl[, independence := 0]
+    tbl[date(date) %in% (holiday.Independence(years) %>% mdy), independence:=1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(independence)], 1:2, 1:2))
+    
+    # labor
+    tbl[, labor := 0]
+    tbl[date(date) %in% (holiday.Labor(years) %>% mdy), labor := 1]
+    
+    # columbus
+    tbl[, columbus := 0]
+    tbl[date(date) %in% (holiday.Columbus(years) %>% mdy), columbus := 1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(columbus)], 1, 0))
+    
+    # veterans
+    tbl[, veterans := 0]
+    tbl[date(date) %in% (holiday.Veterans(years) %>% mdy), veterans := 1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(veterans)], 1, 0))
+    
+    # thanksgiving
+    tbl[, thanksgiving := 0]
+    tbl[date(date) %in% (holiday.Thanksgiving(years) %>% mdy), thanksgiving:=1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(thanksgiving)], 1:2, 1))
+    
+    # christmas
+    tbl[, christmas := 0]
+    tbl[date(date) %in% (holiday.Christmas(years) %>% mdy), christmas:=1]
+    tbl <- cbind(tbl, make_shifts(tbl[,.(christmas)], 1:3, 1:2))
+    
+    # чтобы убрать аномалии
+    # blizzards 2015, 2016
+    blizzards <- c('2016-01-23', '2015-01-26', '2015-01-27') %>% ymd
+    tbl[, blizzard := 0]
+    tbl[date(date) %in% blizzards, blizzard := 1]
+    
+    tbl[, -1]
+}
+```
+
+
+
+##### 7.2 get_dt_agg_aux
+
+```{r}
+#####################################################################
+# агрегируем данные по поездкам и средними продолжительностью, кол-ом 
+# пассажиров, расстоянием и стоимостью
+
+get_dt_agg_aux <- function(dt){
+    # добавим час и день (потом еще надо будет месяц)
+    dt[, `:=`(day = mday(tpep_pickup_datetime),
+              hour = hour(tpep_pickup_datetime))]
+    first_date <- dt[1, tpep_pickup_datetime]
+    
+    # узнаем есть ли пропуски по датам
+    days <- days_in_month(first_date) %>% seq_len
+    missing_days <- setdiff(days, dt[, unique(day)])
+    if (length(missing_days) > 0){
+        # добавляем эти дни в данные
+        dt_missing <- data.table(region = 1, day = missing_days, hour = 0)
+        dt <- rbindlist(list(dt, dt_missing), fill = TRUE)
+    }
+    
+    # узнаем есть ли пропуски по часам
+    missing_hours <- setdiff(1:23, dt[, unique(hour)])
+    if (length(missing_hours) > 0){
+        dt_missing <- data.table(region = 1, day = 1, hour = missing_hours)
+        dt <- rbindlist(list(dt, dt_missing), fill = TRUE)
+    }
+    
+    # узнаем есть ли пропуски по регионам
+    missing_regions <- setdiff(seq_len(nrow(regions)), dt[, unique(region)])
+    if (length(missing_regions) > 0){
+        dt_missing <- data.table(region = missing_regions, day = 1, hour = 0)
+        dt <- rbindlist(list(dt, dt_missing), fill = TRUE)
+    }
+    
+    # делаем сводную
+    setkey(dt, day, hour, region)
+    dt_agg <- dt[CJ(day, hour, region, unique = TRUE), 
+                 .(n = .N,
+                   avr_dur = mean(duration, na.rm = TRUE),
+                   avr_psngr = mean(passenger_count, na.rm = TRUE),
+                   avr_dist = mean(trip_distance, na.rm = TRUE),
+                   avr_tax = mean(total_amount, na.rm = TRUE)),
+                 by = .EACHI]
+    # надо обнулить частоты для искусственно введенных значений
+    dt_agg[(day %in% missing_days) | 
+               (hour %in% missing_hours) | 
+               (region %in% missing_regions), 
+           `:=`(n = 0,
+                avr_dur = 0,
+                avr_psngr = 0,
+                avr_dist = 0,  
+                avr_tax = 0)]
+    
+    # добавляем месяц в получившуюся таблицу
+    dt_agg[, `:=`(month = month(first_date),
+                  year = year(first_date))]
+    
+    replace_NA_by_value(dt_agg)
+    
+    # устанавливаем красивый порядок колонок
+    setcolorder(dt_agg, c('year', 'month', 'day','hour', 'region', 'n',
+                          'avr_dur', 'avr_psngr', 'avr_dist', 'avr_tax' ))
+    
+    dt_agg[]
+}
+
+```
+
+##### 7.3 read_aux_regions_102
+
+```{r}
+############################################################
+# прочитаем все файлы с дополнительными данными
+
+read_aux_regions_102 <- function(verbose = TRUE) {
+    
+    folder <- 'data_out'
+    files <- list.files(paste(getwd(), folder, sep = '/')) %>%
+        paste(getwd(), folder, ., sep = '/')
+    files <- files[grep(pattern = 'aux_', files)]
+    dt <- data.table()
+    
+    # засечем время
+    start <- now()
+    
+    if (verbose) paste('файлов:', length(files), '\n') %>% cat
+    
+    for (filename in files){
+        cat('. ')
+        dt_agg <- fread(filename)
+        dt_aggсмы[, date := parse_date_time(date, "YmdHMS")]
+        print(all(colnames(dt) == colnames(dt_agg)))
+        dt <- rbindlist(list(dt, dt_agg), use.names = TRUE)
+    }
+    
+    setkey(dt, date)
+    
+    if (verbose) paste('\nвремя обработки', 
+                       round(as.numeric(now() - start, units = 'secs'), 1), 
+                       'сек') %>% cat
+    
+    dt[]
+}
+```
+
+
+7.4 raw_to_agg_aux_102
+
+
+```{r}
+####################################################################
+# все файлы из folder_in обрабатываются и записываются в folder_out
+
+raw_to_agg_aux_102 <- function(verbose = TRUE) {
+    # папки и паттерн
+    folder_in <- 'data_in' 
+    folder_out <- 'data_out'
+    yt_pattern <- 'yellow_tripdata_'
+    
+    # засечем время
+    start <- now()
+    
+    # имена файлов с данными
+    files_in <- list.files(paste(getwd(), folder_in, sep = '/'))
+    files_in <- files_in[grep(yt_pattern, files_in)]
+    files_out <- paste0('aux_', sub(yt_pattern, '', files_in))
+    
+    if (verbose) paste('файлов:', length(files_in)) %>% cat
+    
+    # загружаем файлы и сохраняем обработанные
+    for (i in seq_along(files_in)) {
+        # с какими файлами работаем
+        filename_in <- paste(getwd(), folder_in, files_in[i], sep = '/')
+        filename_out <- paste(getwd(), folder_out, files_out[i], sep = '/')
+        if (verbose) paste0('\nфайл[', i, ']: ', files_in[i]) %>% cat
+        
+        # обработка
+        dt_month <- fread(filename_in) # чтение
+        dt_month <- clear_data(dt_month) # очистка таблицы
+        dt_month <- make_regions(dt_month) # присвоение регионов
+        dt_agg <- get_dt_agg_aux(dt_month) # агрегируем с доп признаками
+        # исправим время и удалим ненужные колонки
+        dt_agg[, `:=`(date = paste(year, month, day, hour) %>% ymd_h,
+                      year = NULL, month = NULL, day = NULL, hour = NULL)]
+        # оставляем только 102 региона
+        dt_agg <- dt_agg[region %in% regions_102]
+        value_vars <- setdiff(colnames(dt_agg), c('date', 'region'))
+        dt_agg <- dt_agg %>% dcast(date ~ region, value.var =value_vars)
+        
+        fwrite(dt_agg, filename_out)
+        if (verbose) cat(' ... ок')
+    }
+    
+    if (verbose) paste('\nвремя обработки', 
+                       round(as.numeric(now() - start, units = 'mins'), 1), 
+                       'минут') %>% cat
+    
+}
+```
+
+##### 7.5 make_data
+
+```{r}
+###############################################################################
+# рассчитаем индивидуальные для каждой признаки для текущего горизонта прогноза
+
+make_data <- function(j = 1){
+    data <- data.table() # здесь будут все данные
+    for (reg in seq_along(regions_102)){
+        # cat(regions_102[reg])
+        # доп признаки ср длительность, пассажиры, дистанция и сумма
+        # исходные
+        auxs <- data_2016[, c(paste0(features_aux, regions_102[reg])), 
+                          with=FALSE]
+        # список таблиц
+        auxs <- lapply(colnames(auxs), function(feat){
+            dt <- make_lags_and_sums(auxs[,..feat], lags_aux)[,-1]
+            colnames(dt) <- paste(substr(feat ,1, nchar(feat)-5), 
+                                  colnames(dt), sep = '_')
+            dt
+        })
+        # теперь все в одной
+        auxs <- do.call('cbind', auxs)
+        
+        # предсказания предыдущей модели
+        latter_model <- week_05_pred[order(date)][
+            region == regions_102[reg] & h == j, .(latter_model = y)]
+        latter_model <- make_lags_and_sums(data_full[,-1][, ..reg], 
+                                           lags_latter_model)[,-1]
+        colnames(latter_model) <- paste0('lm_', colnames(latter_model) )
+        
+        # лаги и суммы целевой переменной
+        lags_n_sums <- make_lags_and_sums(data_full[,-1][, ..reg], lags)[,-1]
+        # целевая переменная
+        ys <- data_full[,-1][, shift(.SD, n = hs, type = 'lead'), .SDcols=reg]
+        colnames(ys) <- paste0('y_', hs)
+        
+        # добавим регион
+        region <- paste0('r', regions_102[reg])
+        
+        # соединим все фичи
+        ind_features <- cbind(region, ys, latter_model, lags_n_sums, 
+                              auxs, common_features)
+        
+        # первый расчет?
+        if (reg == 1) {
+            data <- copy(ind_features)
+        } else {
+            data <- rbindlist(list(data, ind_features))
+        }
+    }
+    
+    # регионы в факторы и готово
+    data[, region := as.factor(region)][]
+}
+```
+
+
